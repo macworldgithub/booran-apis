@@ -45,16 +45,16 @@ All store and vehicle endpoints support the following query parameters:
 ### Examples:
 ```bash
 # Get only NEW cars from Cheltenham Kia:
-GET http://localhost:3000/api/stores/cheltenham-kia?type=new
+GET http://localhost:3090/api/stores/cheltenham-kia?type=new
 
 # Get only USED cars from Cranbourne Hyundai:
-GET http://localhost:3000/api/stores/cranbourne-hyundai?type=used
+GET http://localhost:3090/api/stores/cranbourne-hyundai?type=used
 
 # Get IN-STOCK Sorento cars from South Morang Kia:
-GET http://localhost:3000/api/stores/south-morang-kia?carline=SORENTO&status=IN-STOCK
+GET http://localhost:3090/api/stores/south-morang-kia?carline=SORENTO&status=IN-STOCK
 
 # Search all stores for Carnival:
-GET http://localhost:3000/api/vehicles?search=CARNIVAL
+GET http://localhost:3090/api/vehicles?search=CARNIVAL
 ```
 
 ---
@@ -63,7 +63,7 @@ GET http://localhost:3000/api/vehicles?search=CARNIVAL
 
 Start the server and visit:
 ```
-http://localhost:3000/api/docs
+http://localhost:3090/api/docs
 ```
 Interactive UI to test every endpoint, inspect schemas, and view real response payloads.
 
@@ -82,7 +82,7 @@ npm run seed
 
 ### Sync via API Endpoint
 ```bash
-POST http://localhost:3000/api/vehicles/sync
+POST http://localhost:3090/api/vehicles/sync
 ```
 
 ---
