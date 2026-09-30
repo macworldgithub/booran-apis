@@ -3,7 +3,7 @@ export interface StoreMeta {
   storeNumber: string;
   name: string;
   slug: string;
-  brand: 'Kia' | 'Hyundai';
+  brand: string;
   location: string;
 }
 
@@ -35,9 +35,25 @@ export const STORES_MAP: Record<string, StoreMeta> = {
   store50: {
     storeId: 'store50',
     storeNumber: '50',
-    name: 'Dandenong Hyundai',
+    name: 'Dandenong Mitsubishi & Hyundai',
     slug: 'dandenong-hyundai',
-    brand: 'Hyundai',
+    brand: 'Mitsubishi & Hyundai',
+    location: 'Dandenong',
+  },
+  store51: {
+    storeId: 'store51',
+    storeNumber: '51',
+    name: 'Cranbourne MG / Mitsubishi / Kia',
+    slug: 'cranbourne-mg-mits-kia',
+    brand: 'MG / Mitsubishi / Kia',
+    location: 'Cranbourne',
+  },
+  store52: {
+    storeId: 'store52',
+    storeNumber: '52',
+    name: 'Dandenong Nissan & Kia',
+    slug: 'dandenong-nissan-kia',
+    brand: 'Nissan & Kia',
     location: 'Dandenong',
   },
   store70: {
@@ -51,16 +67,18 @@ export const STORES_MAP: Record<string, StoreMeta> = {
   store90: {
     storeId: 'store90',
     storeNumber: '90',
-    name: 'Berwick Hyundai',
+    name: 'Berwick MG & Hyundai',
     slug: 'berwick-hyundai',
-    brand: 'Hyundai',
+    brand: 'MG & Hyundai',
     location: 'Berwick',
   },
 };
 
 export const STORES_LIST: StoreMeta[] = Object.values(STORES_MAP);
 
-export function findStoreByIdentifier(identifier: string): StoreMeta | undefined {
+export function findStoreByIdentifier(
+  identifier: string,
+): StoreMeta | undefined {
   if (!identifier) return undefined;
   const normalized = identifier.toLowerCase().replace(/[^a-z0-9]/g, '');
 

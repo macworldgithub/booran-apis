@@ -24,4 +24,3 @@ import { VehiclesModule } from './vehicles/vehicles.module';
   providers: [AppService],
 })
 export class AppModule {}
-

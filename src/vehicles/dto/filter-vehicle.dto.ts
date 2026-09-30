@@ -37,7 +37,8 @@ export class FilterVehicleDto {
   search?: string;
 
   @ApiPropertyOptional({
-    description: 'Filter by store identifier, slug, or number (for global vehicle query)',
+    description:
+      'Filter by store identifier, slug, or number (for global vehicle query)',
     example: 'cheltenham-kia',
   })
   @IsOptional()
@@ -70,7 +71,8 @@ export class FilterVehicleDto {
   order?: 'asc' | 'desc';
 
   @ApiPropertyOptional({
-    description: 'Pagination limit (defaults to returning all if omitted, or specify integer)',
+    description:
+      'Pagination limit (defaults to returning all if omitted, or specify integer)',
     example: 50,
   })
   @IsOptional()

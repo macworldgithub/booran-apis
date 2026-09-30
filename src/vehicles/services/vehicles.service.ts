@@ -30,6 +30,12 @@ export interface StoreSummary {
   totalVehicles: number;
   newVehicles: number;
   usedVehicles: number;
+  distinctMakesCount: number;
+  makes: {
+    new: string[];
+    used: string[];
+    all: string[];
+  };
   apiEndpoint: string;
 }
 
@@ -189,7 +195,7 @@ export class VehiclesService {
         `Vehicle with stock number '${stockNumber}' not found`,
       );
     }
-    return vehicle as unknown as Vehicle;
+    return vehicle;
   }
 
   /**
@@ -205,24 +211,60 @@ export class VehiclesService {
         $group: {
           _id: { storeId: '$storeId', type: '$type' },
           count: { $sum: 1 },
+          brands: { $addToSet: '$brand' },
         },
       },
     ]);
 
-    const countsMap = new Map<string, { new: number; used: number }>();
+    const countsMap = new Map<
+      string,
+      {
+        new: number;
+        used: number;
+        newBrands: Set<string>;
+        usedBrands: Set<string>;
+      }
+    >();
 
     for (const item of aggregations) {
       const { storeId, type } = item._id;
       if (!countsMap.has(storeId)) {
-        countsMap.set(storeId, { new: 0, used: 0 });
+        countsMap.set(storeId, {
+          new: 0,
+          used: 0,
+          newBrands: new Set(),
+          usedBrands: new Set(),
+        });
       }
       const entry = countsMap.get(storeId)!;
-      if (type === 'new') entry.new += item.count;
-      if (type === 'used') entry.used += item.count;
+      if (type === 'new') {
+        entry.new += item.count;
+        if (Array.isArray(item.brands)) {
+          item.brands.forEach((b: string) => b && entry.newBrands.add(b));
+        }
+      }
+      if (type === 'used') {
+        entry.used += item.count;
+        if (Array.isArray(item.brands)) {
+          item.brands.forEach((b: string) => b && entry.usedBrands.add(b));
+        }
+      }
     }
 
     const stores: StoreSummary[] = STORES_LIST.map((store) => {
-      const counts = countsMap.get(store.storeId) || { new: 0, used: 0 };
+      const counts = countsMap.get(store.storeId) || {
+        new: 0,
+        used: 0,
+        newBrands: new Set<string>(),
+        usedBrands: new Set<string>(),
+      };
+
+      const newBrands = Array.from(counts.newBrands).sort();
+      const usedBrands = Array.from(counts.usedBrands).sort();
+      const allBrands = Array.from(
+        new Set([...newBrands, ...usedBrands]),
+      ).sort();
+
       return {
         storeId: store.storeId,
         storeNumber: store.storeNumber,
@@ -233,6 +275,12 @@ export class VehiclesService {
         totalVehicles: counts.new + counts.used,
         newVehicles: counts.new,
         usedVehicles: counts.used,
+        distinctMakesCount: allBrands.length,
+        makes: {
+          new: newBrands,
+          used: usedBrands,
+          all: allBrands,
+        },
         apiEndpoint: `/api/stores/${store.slug}`,
       };
     });
@@ -244,3 +292,4 @@ export class VehiclesService {
     };
   }
 }
+

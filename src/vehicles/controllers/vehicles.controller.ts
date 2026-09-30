@@ -1,4 +1,12 @@
-import { Controller, Get, Post, Param, Query, HttpCode, HttpStatus } from '@nestjs/common';
+import {
+  Controller,
+  Get,
+  Post,
+  Param,
+  Query,
+  HttpCode,
+  HttpStatus,
+} from '@nestjs/common';
 import { ApiOperation, ApiQuery, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { VehiclesService } from '../services/vehicles.service';
 import { CsvImporterService } from '../services/csv-importer.service';
@@ -40,7 +48,8 @@ export class VehiclesController {
   @HttpCode(HttpStatus.OK)
   @ApiOperation({
     summary: 'Sync CSV files to MongoDB',
-    description: 'Parses all CSV files in the CSVs directory and upserts them into MongoDB.',
+    description:
+      'Parses all CSV files in the CSVs directory and upserts them into MongoDB.',
   })
   @ApiResponse({ status: 200, description: 'Sync completed successfully.' })
   public async syncCsvData() {

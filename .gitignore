@@ -6,7 +6,15 @@
 # CSVs & Data
 /CSVs
 CSVs/
+/erapower_downloads
+erapower_downloads/
 *.csv
+
+# Documentation & Generated Artifacts
+/docs
+docs/
+CLIENT_API_DOCUMENTATION.md
+Booran_Motors_API_Documentation.pdf
 
 
 # Logs
