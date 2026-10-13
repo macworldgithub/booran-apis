@@ -97,6 +97,12 @@ export class VehiclesService {
       ];
     }
 
+    if (filterDto.stockNumber) {
+      const cleanStock = filterDto.stockNumber.trim();
+      const escaped = cleanStock.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      query.stockNumber = new RegExp(`^${escaped}$`, 'i');
+    }
+
     return query;
   }
 
@@ -199,7 +205,51 @@ export class VehiclesService {
   }
 
   /**
-   * Get overview / statistics for all 6 stores
+   * Search across all stores for a stock number and return matching store names and details
+   */
+  public async findStoresByStockNumber(stockNumber: string): Promise<{
+    success: boolean;
+    stockNumber: string;
+    found: boolean;
+    totalStores: number;
+    stores: string[];
+    vehicles: Vehicle[];
+  }> {
+    const cleanStock = (stockNumber || '').trim();
+    if (!cleanStock) {
+      return {
+        success: true,
+        stockNumber: cleanStock,
+        found: false,
+        totalStores: 0,
+        stores: [],
+        vehicles: [],
+      };
+    }
+
+    const escaped = cleanStock.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const records = await this.vehicleModel
+      .find({ stockNumber: new RegExp(`^${escaped}$`, 'i') })
+      .lean()
+      .exec();
+
+    // Distinct store names preserving order
+    const storeNames = Array.from(
+      new Set(records.map((r) => r.storeName).filter(Boolean)),
+    );
+
+    return {
+      success: true,
+      stockNumber: cleanStock,
+      found: storeNames.length > 0,
+      totalStores: storeNames.length,
+      stores: storeNames,
+      vehicles: records as unknown as Vehicle[],
+    };
+  }
+
+  /**
+   * Get overview / statistics for all 8 stores
    */
   public async getStoresOverview(): Promise<{
     success: boolean;

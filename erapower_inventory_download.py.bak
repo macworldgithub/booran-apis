@@ -1,0 +1,834 @@
+"""
+eraPower Inventory CSV Downloader (High-Speed Fresh Navigation Edition)
+========================================================================
+Naming convention:  {store_no}_{SiteName}_{MAKE}_{New|Used}.csv
+Example:            01_BooranCheltenham_CHERY_New.csv
+
+Strategy:
+---------
+Performs a fresh navigation for EVERY make + condition combination:
+    Main Menu → Showroom → Inventory Inquiry → set dropdowns → Find → Download → Exit to Main Menu
+This avoids eraPower's internal session/state bugs while running much faster.
+"""
+
+import sys
+import time
+import re
+from pathlib import Path
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+# ── CONFIGURATION ─────────────────────────────────────────────────────────────
+
+BASE_URL    = "https://c2892-erapower.pentana.cloud/base/templates/vIndependent.htm"
+USERNAME    = "shauns"
+PASSWORD    = "Booran2"
+WORKSTATION = "200"
+
+DOWNLOAD_DIR = Path("erapower_downloads")
+DOWNLOAD_DIR.mkdir(exist_ok=True)
+
+# Dealership rooftops (uncomment stores you want to run)
+ROOFTOPS = [
+    {"store": "01", "name": "BooranCheltenham",            "label": "01| Booran Cheltenham"},
+    # {"store": "20", "name": "CranbourneHyundai",           "label": "20| Cranbourne Hyundai"},
+    # {"store": "40", "name": "SouthMorangHyundai",          "label": "40| South Morang Hyundai"},
+    # {"store": "50", "name": "DandenongMitsubishi_Hyundai", "label": "50| Dandenong Mitsubishi & Hyundai"},
+    # {"store": "51", "name": "Cranbourne_MG_MITS_KIA",      "label": "51| Cranbourne MG/MITS/KIA"},
+    # {"store": "52", "name": "DandenongNI_KI",              "label": "52| Dandenong NI & KI"},
+    # {"store": "70", "name": "SouthMorangKIA",              "label": "70| South Morang KIA"},
+    # {"store": "90", "name": "BerwickMG_Hyundai",           "label": "90| Berwick MG & Hyundai"},
+]
+
+NEW_USED = ["New", "Used"]
+
+CSV_EMPTY_HEADER = (
+    "stock#,carline,description,fa,colour,loc,dest loc,list price,age,deal,status,open ro/po\n"
+)
+
+
+# ── DOM & AJAX HELPERS ────────────────────────────────────────────────────────
+
+def wait_net(page, timeout=5000):
+    try:
+        page.wait_for_load_state("networkidle", timeout=timeout)
+    except Exception:
+        pass
+
+
+def find_in_frames(page, selector, timeout_sec=5.0, must_visible=False):
+    """Search page and all iframes for selector with responsive polling."""
+    start = time.time()
+    while time.time() - start < timeout_sec:
+        for c in [page] + list(page.frames):
+            try:
+                loc = c.locator(selector)
+                if loc.count() > 0:
+                    if not must_visible or loc.first.is_visible():
+                        return loc.first, c
+            except Exception:
+                pass
+        time.sleep(0.1)
+    return None, None
+
+
+def install_xhr_monitor(page):
+    """Inject lightweight XHR monitor across page and all frames (idempotent)."""
+    for c in [page] + list(page.frames):
+        try:
+            c.evaluate("""() => {
+                if (window.__xhrMonInstalled) return;
+                window.__xhrMonInstalled = true;
+                window.__xhrPending = 0;
+                const origSend = XMLHttpRequest.prototype.send;
+                XMLHttpRequest.prototype.send = function(...args) {
+                    window.__xhrPending++;
+                    this.addEventListener('loadend', () => {
+                        window.__xhrPending = Math.max(0, window.__xhrPending - 1);
+                    });
+                    return origSend.apply(this, args);
+                };
+            }""")
+        except Exception:
+            pass
+
+
+def wait_for_ajax(page, max_wait=2.5, quiet_streak=2, poll_interval=0.1):
+    """
+    Wait until in-flight XHRs settle.
+    Returns as soon as 0 requests are pending for `quiet_streak` consecutive polls.
+    """
+    install_xhr_monitor(page)
+    time.sleep(0.1)
+    start = time.time()
+    streak = 0
+    while time.time() - start < max_wait:
+        count = 0
+        for c in [page] + list(page.frames):
+            try:
+                val = c.evaluate("() => window.__xhrPending ?? 0")
+                count += (val or 0)
+            except Exception:
+                pass
+        if count == 0:
+            streak += 1
+            if streak >= quiet_streak:
+                return True
+        else:
+            streak = 0
+        time.sleep(poll_interval)
+    return False
+
+
+def fire_change(el):
+    """Trigger eraPower VRE lifecycle handlers and native change event."""
+    try:
+        el.evaluate("""(sel) => {
+            if (window.VRE) {
+                try { window.VRE.prefield(sel);       } catch(e) {}
+                try { window.VRE.setSubmitQueue(sel); } catch(e) {}
+                try { window.VRE.onChangeSelect(sel); } catch(e) {}
+                try { window.VRE.postfield(sel);      } catch(e) {}
+            }
+            sel.dispatchEvent(new Event('change', { bubbles: true }));
+            sel.blur();
+        }""")
+    except Exception:
+        pass
+
+
+def get_row_text(page, table_name):
+    """Read 'Row X of Y' from the named results table."""
+    for sel in [
+        f"span[name='{table_name}'] #SelectedRec",
+        f"#{table_name} #SelectedRec",
+        "#SelectedRec",
+    ]:
+        el, _ = find_in_frames(page, sel, timeout_sec=0.6)
+        if el:
+            try:
+                return el.inner_text().strip().replace('\xa0', ' ')
+            except Exception:
+                pass
+    return ""
+
+
+def parse_count(text):
+    """Extract the total number of records from 'Row X of Y'."""
+    m = re.search(r'of\s+(\d+)', text, re.I)
+    return int(m.group(1)) if m else -1
+
+
+# ── LOGIN ─────────────────────────────────────────────────────────────────────
+
+def login(page):
+    """Handle eraPower login with detached-frame protection."""
+    page.goto(BASE_URL, wait_until="domcontentloaded", timeout=60000)
+    wait_net(page, 4000)
+
+    user_el, _ = find_in_frames(page, "#user, input[name='user']", timeout_sec=15)
+    if not user_el:
+        print("  (Already authenticated)")
+        return
+
+    print("  Entering credentials...")
+    try:
+        user_el.click()
+    except Exception:
+        pass
+    user_el.fill(USERNAME)
+    user_el.press("Tab")
+
+    # eraPower triggers DefaultWks AJAX on blur which reloads the login iframe.
+    # Wait for the iframe reload to settle so we don't hit a detached frame.
+    time.sleep(2.5)
+
+    # 1. After the iframe reload, verify and ensure Username is still filled!
+    for _ in range(5):
+        try:
+            u_el, _ = find_in_frames(page, "#user, input[name='user']", timeout_sec=5)
+            if u_el and u_el.is_visible():
+                val = ""
+                try:
+                    val = u_el.input_value()
+                except Exception:
+                    pass
+                if val.strip() != USERNAME:
+                    u_el.click()
+                    u_el.fill(USERNAME)
+                    u_el.press("Tab")
+                    time.sleep(0.2)
+                break
+        except Exception:
+            time.sleep(0.4)
+
+    # 2. Re-fetch password with retry in case frame detached during reload
+    for _ in range(5):
+        try:
+            pw, _ = find_in_frames(page, "#password, input[name='password']", timeout_sec=6)
+            if pw and pw.is_visible():
+                pw.click()
+                pw.fill(PASSWORD)
+                pw.press("Tab")
+                time.sleep(0.3)
+                break
+        except Exception:
+            time.sleep(0.4)
+
+    # 3. Re-fetch workstation with retry
+    for _ in range(5):
+        try:
+            ws, _ = find_in_frames(page, "#idLoginWorkstation, input[name='idLoginWorkstation']", timeout_sec=6)
+            if ws and ws.is_visible():
+                ws.click()
+                ws.press("Control+A")
+                ws.press("Backspace")
+                ws.fill(WORKSTATION)
+                ws.press("Tab")
+                time.sleep(0.3)
+                break
+        except Exception:
+            time.sleep(0.4)
+
+    # 4. Final safety check on username before clicking Sign In
+    try:
+        u_final, _ = find_in_frames(page, "#user, input[name='user']", timeout_sec=2)
+        if u_final and u_final.input_value().strip() != USERNAME:
+            u_final.fill(USERNAME)
+    except Exception:
+        pass
+
+    # 5. Click sign in button
+    for _ in range(5):
+        try:
+            btn, _ = find_in_frames(page, "#Button52, input[value='SIGN IN']", timeout_sec=6)
+            if btn and btn.is_visible():
+                btn.click()
+            else:
+                page.keyboard.press("Enter")
+            break
+        except Exception:
+            time.sleep(0.5)
+
+    time.sleep(2.0)
+    wait_net(page, 15000)
+    print("  Logged in ✓")
+
+
+# ── ROOFTOP SWITCHER ──────────────────────────────────────────────────────────
+
+def get_active_entity(page):
+    el, _ = find_in_frames(page, "#EntityMenu", timeout_sec=2.0)
+    if el:
+        try:
+            return el.inner_text().strip()
+        except Exception:
+            pass
+    return ""
+
+
+def select_rooftop(page, rooftop):
+    store = rooftop["store"]
+    name = rooftop["name"]
+    print(f"\n{'='*62}")
+    print(f"  ROOFTOP  {store} | {name}")
+    print(f"{'='*62}")
+
+    current = get_active_entity(page)
+    if current and store in current:
+        print(f"  ✓ Already active: {current}")
+        return
+
+    # 1. Try JS API first
+    switched = False
+    for c in [page] + list(page.frames):
+        try:
+            ok = c.evaluate(f"""() => {{
+                const id = 'STORE{store}';
+                if (window.top?.container?.setCurrentEntityAction) {{
+                    window.top.container.setCurrentEntityAction(id); return true;
+                }}
+                if (window.container?.setCurrentEntityAction) {{
+                    window.container.setCurrentEntityAction(id); return true;
+                }}
+                return false;
+            }}""")
+            if ok:
+                switched = True
+                break
+        except Exception:
+            pass
+
+    # 2. UI fallback
+    if not switched:
+        menu, _ = find_in_frames(page, "#EntityMenu, td#EntityMenu, [onclick*='entityMenuClick']", timeout_sec=4)
+        if menu:
+            menu.click()
+            time.sleep(0.4)
+        opt, _ = find_in_frames(page, f"#STORE{store}, div[id='STORE{store}']", timeout_sec=4)
+        if opt:
+            opt.click()
+
+    time.sleep(0.8)
+    current = get_active_entity(page)
+    if current:
+        print(f"  ✓ Active: {current}")
+
+
+# ── FAST BACK-AND-FORTH NAVIGATION ────────────────────────────────────────────
+
+def dismiss_in_page_modals(page):
+    """
+    Dismiss any in-page popup modal (e.g. 'ERAnet Administration menu' [OK] or warning alerts).
+    """
+    for c in [page] + list(page.frames):
+        try:
+            c.evaluate("""() => {
+                const buttons = Array.from(document.querySelectorAll("button, input[type='button'], div.Standard-Label-PSWhiteonGreyActBtn, div[action]"));
+                for (const b of buttons) {
+                    const txt = b.textContent.trim().toLowerCase();
+                    if (txt === 'ok' || txt === 'close') {
+                        b.click();
+                        return true;
+                    }
+                }
+                const closeBtn = document.querySelector(".ui-dialog-titlebar-close, [title='Close']");
+                if (closeBtn) {
+                    closeBtn.click();
+                    return true;
+                }
+                return false;
+            }""")
+        except Exception:
+            pass
+
+
+def go_to_inventory_fresh(page):
+    """
+    High-speed navigation: Main Menu → Showroom → Inventory Inquiry.
+    Uses element appearance checks instead of stalling on networkidle.
+    """
+    dismiss_in_page_modals(page)
+
+    # 1. Click Showroom
+    for sel in [
+        "span[xmlid='ShowrMenu']", "img[src*='flaticonShowroom']",
+        "span.MenuItem:has-text('Showroom')", "text=Showroom"
+    ]:
+        el, _ = find_in_frames(page, sel, timeout_sec=2.5)
+        if el:
+            try:
+                el.click()
+                break
+            except Exception:
+                pass
+    time.sleep(0.3)
+    dismiss_in_page_modals(page)
+
+    # 2. Click Inventory Inquiry
+    for sel in [
+        "span[xmlid='StockInquiry']", "img[src*='StockInquirySearch']",
+        "span.MenuItem:has-text('Inventory Inquiry')", "text=Inventory Inquiry"
+    ]:
+        el, _ = find_in_frames(page, sel, timeout_sec=2.5)
+        if el:
+            try:
+                el.click()
+                break
+            except Exception:
+                pass
+    time.sleep(0.3)
+    find_in_frames(page, "#selNewUsed, select[name='selNewUsed']", timeout_sec=5.0)
+
+
+def exit_once(page):
+    """
+    Click the Exit button strictly (Inventory -> Showroom, or Showroom -> Main Menu).
+    Does NOT use blind #But1, which hits the 'ERAnet Administration menu' tile on Showroom!
+    """
+    dismiss_in_page_modals(page)
+
+    clicked = False
+    for c in [page] + list(page.frames):
+        try:
+            ok = c.evaluate("""() => {
+                const candidates = Array.from(document.querySelectorAll("span#caption, .ActUpButtonCaption, div[action='Exit'], button, div.Standard-Label-PSWhiteonGreyActBtn"));
+                const exitBtn = candidates.find(el => {
+                    const txt = el.textContent.trim().toLowerCase();
+                    return txt === 'exit' || el.getAttribute('action') === 'Exit';
+                });
+                if (exitBtn) {
+                    (exitBtn.closest("div[action]") || exitBtn.closest("button") || exitBtn).click();
+                    return true;
+                }
+                return false;
+            }""")
+            if ok:
+                clicked = True
+                break
+        except Exception:
+            pass
+
+    if not clicked:
+        btn, _ = find_in_frames(
+            page,
+            "span#caption:has-text('Exit'), div[action='Exit'], .ActUpButtonCaption:has-text('Exit'), button:has-text('Exit')",
+            timeout_sec=2.0
+        )
+        if btn:
+            try:
+                btn.click(timeout=1500)
+            except Exception:
+                pass
+
+    time.sleep(0.3)
+    dismiss_in_page_modals(page)
+
+
+def exit_to_main(page):
+    """Click Exit twice: Inventory Inquiry → Showroom → Main Menu."""
+    exit_once(page)
+    exit_once(page)
+    time.sleep(0.2)
+
+
+# ── DROPDOWN SETTERS ──────────────────────────────────────────────────────────
+
+def set_new_used(page, value):
+    """Set New/Used condition in #selNewUsed."""
+    el, _ = find_in_frames(page, "#selNewUsed, select[name='selNewUsed']", timeout_sec=5.0)
+    if not el:
+        return False
+
+    try:
+        curr = el.evaluate("s => s.value")
+        if curr == value:
+            return True
+    except Exception:
+        pass
+
+    try:
+        el.select_option(value=value)
+    except Exception:
+        try:
+            el.select_option(label=value)
+        except Exception:
+            pass
+
+    fire_change(el)
+    # PostNewUsed repopulates makes
+    wait_for_ajax(page, max_wait=2.5)
+    return True
+
+
+def get_makes(page):
+    """Read available makes dynamically from #selMakeInventory."""
+    el, _ = find_in_frames(page, "#selMakeInventory, select[name='selMakeInventory']", timeout_sec=5)
+    if not el:
+        return []
+    try:
+        return el.evaluate("""sel => Array.from(sel.options)
+            .filter(o => o.value && o.value.trim() !== '')
+            .map(o => {
+                const text = (o.text || '').trim();
+                const parts = text.split('-');
+                const code = parts.length > 1
+                    ? parts.slice(1).join('-').trim().replace(/[^A-Za-z0-9]/g, '')
+                    : o.value.trim();
+                return { val: o.value.trim(), code: code || o.value.trim(), label: text };
+            })""")
+    except Exception:
+        return []
+
+
+def set_make(page, make_val, make_code):
+    """Select make in #selMakeInventory and trigger PostMake."""
+    el, _ = find_in_frames(page, "#selMakeInventory, select[name='selMakeInventory']", timeout_sec=5)
+    if not el:
+        return False
+
+    selected = False
+    try:
+        el.select_option(value=make_val)
+        selected = True
+    except Exception:
+        try:
+            el.select_option(label=make_code)
+            selected = True
+        except Exception:
+            pass
+
+    if not selected:
+        return False
+
+    # Trigger eraPower handlers + PostMake
+    try:
+        el.evaluate("""(sel) => {
+            if (window.VRE) {
+                try { window.VRE.prefield(sel);       } catch(e) {}
+                try { window.VRE.setSubmitQueue(sel); } catch(e) {}
+                try { window.VRE.onChangeSelect(sel); } catch(e) {}
+                try { window.VRE.postfield(sel);      } catch(e) {}
+            }
+            if (window.VSC?.PostMake) {
+                try { window.VSC.PostMake('Inventory'); } catch(e) {}
+            }
+            sel.dispatchEvent(new Event('change', { bubbles: true }));
+            sel.blur();
+        }""")
+    except Exception:
+        pass
+
+    wait_for_ajax(page, max_wait=2.5)
+    return True
+
+
+def set_location_all(page):
+    """Ensure Location is set to 'All' without redundant triggers."""
+    el, _ = find_in_frames(page, "#selLocation, select[name='selLocation']", timeout_sec=3)
+    if not el:
+        return
+    try:
+        if el.evaluate("s => s.value") == "All":
+            return
+    except Exception:
+        pass
+
+    try:
+        el.select_option(value="All")
+    except Exception:
+        try:
+            el.select_option(label="All")
+        except Exception:
+            return
+    fire_change(el)
+    time.sleep(0.1)
+
+
+# ── FIND & RESULTS ────────────────────────────────────────────────────────────
+
+def click_find(page, table_name, dialog_tracker):
+    """
+    Click Find button (#But0).
+    - Instantly returns ("Row 0 of 0", 0) if an alert dialog appears.
+    - Waits for MutationObserver or text change from text_before to confirm the server query finished.
+    """
+    dialog_tracker["occurred"] = False
+    dialog_tracker["message"] = ""
+
+    # Snapshot the text before clicking Find so we don't prematurely exit on pre-existing placeholder text
+    text_before = get_row_text(page, table_name)
+
+    for c in [page] + list(page.frames):
+        try:
+            c.evaluate(f"""() => {{
+                window.__tableRefreshed = false;
+                const node =
+                    document.querySelector("span[name='{table_name}']") ||
+                    document.getElementById('{table_name}');
+                if (node) {{
+                    const obs = new MutationObserver(() => {{
+                        window.__tableRefreshed = true;
+                        obs.disconnect();
+                    }});
+                    obs.observe(node, {{ childList: true, subtree: true, characterData: true }});
+                }}
+            }}""")
+        except Exception:
+            pass
+
+    find_btn, _ = find_in_frames(page, "#But0, div[action='Find']", timeout_sec=3.5)
+    if not find_btn:
+        print("[Find btn missing]", end=" ", flush=True)
+        return "", 0
+
+    try:
+        find_btn.click(timeout=2000)
+    except Exception:
+        try:
+            find_btn.evaluate("b => b.click()")
+        except Exception:
+            print("[Find click failed]", end=" ", flush=True)
+            return "", 0
+
+    # Poll loop for eraPower query to complete
+    deadline = time.time() + 6.0
+    refreshed = False
+    while time.time() < deadline:
+        time.sleep(0.08)
+
+        # 1. Dialog triggered (0 records)
+        if dialog_tracker["occurred"]:
+            msg = dialog_tracker["message"]
+            print(f"[0 records (dialog: {msg!r})]", end=" ", flush=True)
+            return "Row 0 of 0", 0
+
+        # 2. MutationObserver triggered (table refreshed by eraPower)
+        for c in [page] + list(page.frames):
+            try:
+                if c.evaluate("() => window.__tableRefreshed ?? false"):
+                    refreshed = True
+                    break
+            except Exception:
+                pass
+        if refreshed:
+            break
+
+        # 3. Row count text changed from text_before
+        cur_text = get_row_text(page, table_name)
+        if cur_text and cur_text != text_before:
+            refreshed = True
+            break
+
+    if dialog_tracker["occurred"]:
+        return "Row 0 of 0", 0
+
+    # If the table did not refresh with new results, 0 records exist
+    if not refreshed:
+        print("[0 records]", end=" ", flush=True)
+        return "Row 0 of 0", 0
+
+    # Brief stabilization pause so eraPower renders rows and enables Export button
+    time.sleep(0.5)
+
+    row_text = get_row_text(page, table_name)
+    count = parse_count(row_text)
+    if count == -1:
+        count = 0
+
+    print(f"[{row_text or f'0 of {count}'}]", end=" ", flush=True)
+    return row_text, count
+
+
+# ── CSV DOWNLOAD ──────────────────────────────────────────────────────────────
+
+def download_csv(page, store, site, make_code, nu_code, total_records):
+    """
+    Save CSV for the make & condition.
+    - If total_records == 0: writes empty CSV header immediately (zero overhead).
+    - If total_records > 0: clicks table export icon and saves the file.
+    """
+    filename = f"{store}_{site}_{make_code}_{nu_code}.csv"
+    dest = DOWNLOAD_DIR / filename
+    table_name = "dtbNewResults" if nu_code == "New" else "dtbUsedResults"
+
+    if total_records == 0:
+        dest.write_text(CSV_EMPTY_HEADER, encoding="utf-8")
+        print(f"→ Saved (0 records) {filename}")
+        return True
+
+    # Locate export button in the active table
+    exp_btn = None
+    for sel in [
+        f"span[name='{table_name}'] img#Exp",
+        f"#{table_name} img#Exp",
+        f"span[name='{table_name}'] img[name='Exp']",
+        f"span[name='{table_name}'] .TableExportUpButton",
+        f"#{table_name} .TableExportUpButton",
+    ]:
+        exp_btn, _ = find_in_frames(page, sel, timeout_sec=4.0)
+        if exp_btn:
+            break
+
+    if not exp_btn:
+        print(f"✗ Export button not found ({filename})")
+        return False
+
+    try:
+        with page.expect_download(timeout=20000) as dl_info:
+            try:
+                exp_btn.click(force=True)
+            except Exception:
+                exp_btn.evaluate("e => e.click()")
+        dl_info.value.save_as(str(dest.resolve()))
+        print(f"→ Saved ({total_records} records) {filename}")
+        time.sleep(0.2)
+        return True
+    except Exception as e:
+        print(f"✗ Download failed: {e}")
+        return False
+
+
+# ── CORE LOOP: HIGH-SPEED FRESH NAVIGATION PER MAKE ───────────────────────────
+
+def run_rooftop(page, rooftop, dialog_tracker):
+    """
+    Process a rooftop by performing a high-speed FRESH navigation for every make:
+      1. Switch rooftop.
+      2. Quick pass to read available makes for New & Used.
+      3. For every make:
+         Main Menu → Showroom → Inventory Inquiry → set dropdowns → Find → Download → Exit to Main
+    """
+    store = rooftop["store"]
+    site  = rooftop["name"]
+
+    select_rooftop(page, rooftop)
+
+    # First pass: Fast discovery of available makes for each condition (~3s total)
+    make_map = {}
+    for nu in NEW_USED:
+        print(f"\n  Checking makes for {nu} …")
+        go_to_inventory_fresh(page)
+        if not set_new_used(page, nu):
+            print(f"  ✗ Could not set {nu}")
+            make_map[nu] = []
+        else:
+            makes = get_makes(page)
+            make_map[nu] = makes
+            print(f"  Makes ({nu}): {[m['code'] for m in makes]}")
+        exit_to_main(page)
+
+    # Second pass: High-speed fresh navigation per make + condition
+    for nu in NEW_USED:
+        table_name = "dtbNewResults" if nu == "New" else "dtbUsedResults"
+        makes = make_map.get(nu, [])
+        if not makes:
+            print(f"\n  No makes for {nu} — skipping")
+            continue
+
+        for make in makes:
+            make_val  = make["val"]
+            make_code = make["code"]
+            filename  = f"{store}_{site}_{make_code}_{nu}.csv"
+
+            # Skip if already downloaded
+            if (DOWNLOAD_DIR / filename).exists():
+                print(f"  ✓ Already exists — skip: {filename}")
+                continue
+
+            print(f"\n  → {nu} / {make_code} … ", end="", flush=True)
+
+            try:
+                # 1. Fresh navigation into Inventory Inquiry (clears eraPower state)
+                go_to_inventory_fresh(page)
+
+                # 2. Set Condition (New / Used)
+                if not set_new_used(page, nu):
+                    print("✗ Condition not set")
+                    exit_to_main(page)
+                    continue
+
+                # 3. Set Make
+                if not set_make(page, make_val, make_code):
+                    print("✗ Make not set")
+                    exit_to_main(page)
+                    continue
+
+                # 4. Set Location = All
+                set_location_all(page)
+
+                # 5. Find + wait for refresh (instant on dialog)
+                row_text, count = click_find(page, table_name, dialog_tracker)
+
+                # 6. Download CSV (or write 0-record file)
+                download_csv(page, store, site, make_code, nu, count)
+
+                # 7. Exit back to Main Menu for the next fresh cycle
+                exit_to_main(page)
+
+            except PWTimeout:
+                print("✗ Timeout")
+                try:
+                    exit_to_main(page)
+                except Exception:
+                    pass
+            except Exception as e:
+                print(f"✗ {e}")
+                try:
+                    exit_to_main(page)
+                except Exception:
+                    pass
+
+
+# ── MAIN ──────────────────────────────────────────────────────────────────────
+
+def main():
+    # Only run enabled rooftops from the config
+    rooftops_to_run = ROOFTOPS
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=False,
+            downloads_path=str(DOWNLOAD_DIR.resolve()),
+            args=["--start-maximized"],
+            slow_mo=0,  # Native speed execution
+        )
+        ctx  = browser.new_context(accept_downloads=True, viewport={"width": 1600, "height": 900})
+        page = ctx.new_page()
+
+        # Track dialogs in real-time
+        dialog_tracker = {"occurred": False, "message": ""}
+
+        def on_dialog(d):
+            dialog_tracker["occurred"] = True
+            dialog_tracker["message"] = d.message
+            d.accept()
+
+        page.on("dialog", on_dialog)
+
+        print("=" * 62)
+        print("  eraPower Inventory Downloader (High-Speed Fresh Navigation)")
+        print(f"  Target stores ({len(rooftops_to_run)}): {[r['store'] for r in rooftops_to_run]}")
+        print("=" * 62)
+
+        login(page)
+
+        for rooftop in rooftops_to_run:
+            try:
+                run_rooftop(page, rooftop, dialog_tracker)
+            except Exception as e:
+                print(f"\n  ✗ Error on {rooftop['store']}: {e}")
+                try:
+                    page.goto(BASE_URL, wait_until="domcontentloaded", timeout=30000)
+                    time.sleep(1.0)
+                except Exception:
+                    pass
+
+        print("\n" + "=" * 62)
+        print(f"  All done! Files saved to: {DOWNLOAD_DIR.resolve()}")
+        print("=" * 62)
+        input("\n  Press ENTER to close browser … ")
+        browser.close()
+
+
+if __name__ == "__main__":
+    main()

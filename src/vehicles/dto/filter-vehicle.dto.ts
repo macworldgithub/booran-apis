@@ -37,6 +37,14 @@ export class FilterVehicleDto {
   search?: string;
 
   @ApiPropertyOptional({
+    description: 'Filter by exact stock number (case-insensitive)',
+    example: 'P251203',
+  })
+  @IsOptional()
+  @IsString()
+  stockNumber?: string;
+
+  @ApiPropertyOptional({
     description:
       'Filter by store identifier, slug, or number (for global vehicle query)',
     example: 'cheltenham-kia',

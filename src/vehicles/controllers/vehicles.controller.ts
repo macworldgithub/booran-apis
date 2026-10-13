@@ -6,6 +6,7 @@ import {
   Query,
   HttpCode,
   HttpStatus,
+  BadRequestException,
 } from '@nestjs/common';
 import { ApiOperation, ApiQuery, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { VehiclesService } from '../services/vehicles.service';
@@ -33,6 +34,50 @@ export class VehiclesController {
   @ApiQuery({ name: 'search', required: false })
   public async getAllVehicles(@Query() filterDto: FilterVehicleDto) {
     return this.vehiclesService.getAllVehicles(filterDto);
+  }
+
+  @Get(['stores-by-stock', 'search-stores'])
+  @ApiOperation({
+    summary: 'Search stores carrying vehicle by stock number (query param)',
+    description:
+      'Search across all stores for a stock number and return all store names where it exists.',
+  })
+  @ApiQuery({
+    name: 'stockNumber',
+    required: true,
+    description: 'Vehicle stock number, e.g. P251203',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Returns store names where the vehicle exists.',
+  })
+  public async findStoresByStockQuery(
+    @Query('stockNumber') stockNumber?: string,
+  ) {
+    if (!stockNumber || !stockNumber.trim()) {
+      throw new BadRequestException('Query parameter "stockNumber" is required');
+    }
+    return this.vehiclesService.findStoresByStockNumber(stockNumber);
+  }
+
+  @Get([
+    'stores-by-stock/:stockNumber',
+    'search-stores/:stockNumber',
+    'stock/:stockNumber/stores',
+  ])
+  @ApiOperation({
+    summary: 'Search stores carrying vehicle by stock number (path param)',
+    description:
+      'Search across all stores for a stock number and return all store names where it exists.',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Returns store names where the vehicle exists.',
+  })
+  public async findStoresByStockParam(
+    @Param('stockNumber') stockNumber: string,
+  ) {
+    return this.vehiclesService.findStoresByStockNumber(stockNumber);
   }
 
   @Get(':stockNumber')
